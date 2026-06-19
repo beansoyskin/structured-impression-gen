@@ -8,8 +8,8 @@
 | 阶段 | 状态 | 说明 |
 |---|---|---|
 | §4.0 数据归一化 | ✅ 完成 | head 归一 + location 规范化，14万样本已跑出产物 |
+| §4.3 Knowledge Lookup | ✅ 完成 | 语料内 suggestive_of 统计表（1585源/10245边/50852次） |
 | §4.2 Case Retrieval | ⏳ 待做 | BM25 + 神经重排 |
-| §4.3 Knowledge Lookup | ⏳ 待做 | 语料内 suggestive_of 统计 |
 | §4.4 Abstraction+Inference | ⏳ 待做 | LLM + schema 约束 |
 | §4.5 Self-Reflective Verification | ⏳ 待做 | 7 个 check 函数 |
 | §4.6 Verbalize | ⏳ 待做 | 小 LLM |
@@ -18,17 +18,23 @@
 
 ```
 ZCodeProject/
-├── src/norm/                    # §4.0 归一化模块（零第三方依赖）
-│   ├── head_norm.py             # head 归一化：lemmatizer + 别名表 + 短语归并
-│   └── location_norm.py         # location 规范化：laterality + region + lobe
+├── src/
+│   ├── norm/                    # §4.0 归一化模块（零第三方依赖）
+│   │   ├── head_norm.py         # head 归一化：lemmatizer + 别名表 + 短语归并
+│   │   └── location_norm.py     # location 规范化：laterality + region + lobe
+│   └── knowledge/               # §4.3 知识源
+│       └── suggestive_table.py  # suggestive_of 统计表（构建器+查询器）
 ├── scripts/
-│   ├── build_norm.py            # 在全量数据上构建两份 JSON 产物
+│   ├── build_norm.py            # §4.0 全量构建 head/location 映射
+│   ├── build_suggestive_table.py# §4.3 全量构建 suggestive_of 统计表
 │   └── inspect_other_region.py  # 诊断 region=other 的 location
-├── outputs/                     # 产物（gitignore，可重建）
-│   ├── head_norm.json           # raw head → 归一 head 映射
-│   └── location_norm.json       # raw location → {laterality, region, lobe}
+├── outputs/                     # 产物（入库，可重建）
+│   ├── head_norm.json           # §4.0: raw head → 归一 head
+│   ├── location_norm.json       # §4.0: raw location → {laterality, region, lobe}
+│   └── suggestive_of_table.json # §4.3: source_head → 候选诊断(频次/置信度)
+├── docs/                        # 研究方法文档
 ├── profile_data.py              # 全量数据画像（附录A来源）
-├── sample_heads.py / sample_locations.py  # 采样诊断脚本
+├── sample_*.py                  # 采样诊断脚本（heads/locations/suggestive）
 ├── requirements.txt             # 可选依赖（核心代码零依赖）
 └── .gitignore
 ```
