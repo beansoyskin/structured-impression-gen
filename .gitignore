@@ -30,8 +30,8 @@ desktop.ini
 # 原始数据 JSONL 不入库（体积大，外部路径）
 data/raw/
 *.jsonl
-# outputs 产物入库（§4.0 交付物，体积小，便于他人 clone 复现）
-# 如产物变大需排除，改回 outputs/*.json
+# outputs 小产物入库（head_norm/location_norm/suggestive_of_table），大产物排除
+outputs/bm25_index.json
 
 # 但保留 lexicons 目录下的受控词表（手写，需跟踪）
 !data/lexicons/**

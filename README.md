@@ -9,7 +9,7 @@
 |---|---|---|
 | §4.0 数据归一化 | ✅ 完成 | head 归一 + location 规范化，14万样本已跑出产物 |
 | §4.3 Knowledge Lookup | ✅ 完成 | 语料内 suggestive_of 统计表（1585源/10245边/50852次） |
-| §4.2 Case Retrieval | ⏳ 待做 | BM25 + 神经重排 |
+| §4.2 Case Retrieval | ✅ BM25 baseline 完成 | recall@5=50.7%, recall@10=59.5% (Jaccard≥0.5) |
 | §4.4 Abstraction+Inference | ⏳ 待做 | LLM + schema 约束 |
 | §4.5 Self-Reflective Verification | ⏳ 待做 | 7 个 check 函数 |
 | §4.6 Verbalize | ⏳ 待做 | 小 LLM |
@@ -22,11 +22,16 @@ ZCodeProject/
 │   ├── norm/                    # §4.0 归一化模块（零第三方依赖）
 │   │   ├── head_norm.py         # head 归一化：lemmatizer + 别名表 + 短语归并
 │   │   └── location_norm.py     # location 规范化：laterality + region + lobe
-│   └── knowledge/               # §4.3 知识源
-│       └── suggestive_table.py  # suggestive_of 统计表（构建器+查询器）
+│   ├── knowledge/               # §4.3 知识源
+│   │   └── suggestive_table.py  # suggestive_of 统计表（构建器+查询器）
+│   └── retrieval/               # §4.2 案例检索
+│       ├── serialize.py         # finding 序列化器（BM25 token + 可读文本）
+│       ├── bm25_retriever.py    # BM25 检索器（建索引+查询+持久化）
+│       └── evaluate.py          # Recall@K 评测
 ├── scripts/
 │   ├── build_norm.py            # §4.0 全量构建 head/location 映射
 │   ├── build_suggestive_table.py# §4.3 全量构建 suggestive_of 统计表
+│   ├── build_and_eval_retrieval.py # §4.2 构建索引+评测
 │   └── inspect_other_region.py  # 诊断 region=other 的 location
 ├── outputs/                     # 产物（入库，可重建）
 │   ├── head_norm.json           # §4.0: raw head → 归一 head
