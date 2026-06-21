@@ -12,7 +12,7 @@
 | §4.2 Case Retrieval | ✅ BM25 baseline 完成 | recall@5=50.7%, recall@10=59.5% (Jaccard≥0.5) |
 | §4.5 Verification | ✅ 确定性 check 完成 | 6个纯规则check，真实数据98.1%通过 |
 | §4.4 Abstraction+Inference | ✅ v1 完成（需迭代） | Qwen3:14b + 知识RAG，exact_fact_f1≈0.25 |
-| §4.6 Verbalize | ⏳ 待做 | 小 LLM |
+| §4.6 Verbalize | ✅ deterministic v1 | 保真组装 assertion/location/modifier/suggestive_of |
 
 ## 目录结构
 
@@ -24,10 +24,12 @@ ZCodeProject/
 │   │   └── location_norm.py     # location 规范化：laterality + region + lobe
 │   ├── knowledge/               # §4.3 知识源
 │   │   └── suggestive_table.py  # suggestive_of 统计表（构建器+查询器）
-│   └── retrieval/               # §4.2 案例检索
-│       ├── serialize.py         # finding 序列化器（BM25 token + 可读文本）
-│       ├── bm25_retriever.py    # BM25 检索器（建索引+查询+持久化）
-│       └── evaluate.py          # Recall@K 评测
+│   ├── retrieval/               # §4.2 案例检索
+│   │   ├── serialize.py         # finding 序列化器（BM25 token + 可读文本）
+│   │   ├── bm25_retriever.py    # BM25 检索器（建索引+查询+持久化）
+│   │   └── evaluate.py          # Recall@K 评测
+│   └── verbalize/               # §4.6 结构化 fact 保真组装为文本
+│       └── verbalizer.py        # 确定性 verbalizer + source fact trace
 ├── scripts/
 │   ├── build_norm.py            # §4.0 全量构建 head/location 映射
 │   ├── build_suggestive_table.py# §4.3 全量构建 suggestive_of 统计表

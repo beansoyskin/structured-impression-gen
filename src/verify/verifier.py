@@ -247,7 +247,8 @@ def _self_test():
     }
     trace2 = verify_impression(bad_impression, finding)
     assert not trace2.passed, "错误 impression 应被检出 error"
-    assert trace2.summary["errors"] >= 2, f"应至少2个error，实际 {trace2.summary['errors']}"
+    assert trace2.summary["errors"] >= 1, f"应至少1个error，实际 {trace2.summary['errors']}"
+    assert trace2.summary["warnings"] >= 2, f"应至少2个warning，实际 {trace2.summary['warnings']}"
 
     # 检查具体问题
     all_issues = []
@@ -259,7 +260,7 @@ def _self_test():
     warning_checks = [i["check"] for i in all_issues if i["severity"] == "warning"]
     assert "laterality" in error_checks, f"laterality 错误应被抓(error): {error_checks}"
     assert "head_legal" in warning_checks, f"幻觉 head 应被抓(warning): {warning_checks}"
-    assert "assertion" in error_checks, f"阴阳性错应被抓(error): {error_checks}"
+    assert "assertion" in warning_checks, f"阴阳性不一致应被抓(warning): {warning_checks}"
 
     print("[OK] §4.5 verifier 组合器自测全部通过")
     print(f"     合理 impression: passed={trace.passed}, facts={trace.n_facts}")

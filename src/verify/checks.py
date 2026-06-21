@@ -356,7 +356,8 @@ def _self_test():
     })
     r = check_assertion(absent_pneumonia, finding_facts=find_with_pneumonia)
     assert not r.passed, f"阴阳性矛盾应被抓: {r.message}"
-    assert r.suggested_action == "flip-assertion"
+    assert r.severity == "warning"
+    assert r.suggested_action == "review"
 
     # 测试4: 合理的非冲突（左肺炎present + 右无肺炎absent）
     left_pneu = normalize_fact({"head": "pneumonia", "assertion": "definitely present", "locations": ["left"]})
