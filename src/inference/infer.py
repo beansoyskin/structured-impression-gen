@@ -271,11 +271,12 @@ def infer_impression(
         # 对 finding 里所有 head 查候选
         all_candidates = []
         seen_targets = set()
+        # 全局 finding 上下文（用于逆向逻辑）
         for bucket in ("positive", "negative", "uncertain", "other"):
             for f in finding_compact.get(bucket, []) or []:
                 h = f.get("head") or ""
                 if h:
-                    cands = knowledge.query_candidates(h, topk=5)
+                    cands = knowledge.query_candidates(h, topk=5, finding_compact=finding_compact)
                     for c in cands:
                         key = (c["target_head"], c["target_assertion"])
                         if key not in seen_targets:

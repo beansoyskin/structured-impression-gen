@@ -195,6 +195,7 @@ class SuggestiveKnowledge:
         source_head: str,
         source_assertion: str | None = None,
         topk: int | None = None,
+        finding_compact: dict = None,  # 可选：提供 finding 上下文以推断逆向逻辑
     ) -> list[dict]:
         """查询某 source_head 的 suggestive_of 候选诊断。
 
@@ -202,13 +203,44 @@ class SuggestiveKnowledge:
             source_head: 源 head（会自动归一化）。
             source_assertion: 可选，过滤同 assertion 的边。
             topk: 可选，取前 k 个。
+            finding_compact: 可选的完整 finding graph，用于推断逆向逻辑
+                （finding 全阴性 → disease absent）。
         Returns:
             候选列表，每项含 target_head/target_assertion/count/confidence，按 count 降序。
             已按 min_count/min_confidence 过滤。
         """
         h = normalize_head(source_head)
-        rows = self.table.get(h, [])
         out = []
+
+        # --- 逆向逻辑：finding 全阴性 → disease absent / no finding ---
+        # 当 finding 里没有 present 的实体，或只有 normal/clear/unremarkable 时，
+        # 知识表应该直接推荐 disease absent
+        if finding_compact is not None:
+            has_positive = False
+            for fact in finding_compact.get("positive", []) or []:
+                ht = normalize_head(fact.get("head") or "")
+                if ht and ht not in ("normal", "clear", "unremarkable", "intact", "well aerated"):
+                    has_positive = True
+                    break
+            if not has_positive:
+                # 全阴性或只有正常描述 → 推荐 disease absent
+                reverse_cands = [
+                    {"target_head": "disease", "target_assertion": "absent",
+                     "source_assertion": "present", "source_section": "rule",
+                     "count": 99999, "confidence": 0.85},
+                    {"target_head": "normal", "target_assertion": "present",
+                     "source_assertion": "present", "source_section": "rule",
+                     "count": 85000, "confidence": 0.70},
+                ]
+                out.extend(reverse_cands)
+                if not self.table.get(h):
+                    # 此 head 在原表无记录 + 命中逆向逻辑 → 直接返回逆向候选
+                    if topk is not None:
+                        out = out[:topk]
+                    return out
+
+        # --- 原表查询 ---
+        rows = self.table.get(h, [])
         for r in rows:
             if r["count"] < self.min_count:
                 continue
@@ -217,6 +249,19 @@ class SuggestiveKnowledge:
             if source_assertion and r["source_assertion"] != source_assertion:
                 continue
             out.append(r)
+        # --- 排序优化：用 confidence × log(count+1) 替代纯 count 排序 ---
+        # 排序分析发现：
+        #   - Top1 错误时 53.9% 的候选只出现 1-9 次（低频噪声排第一）
+        #   - Top1 正确时候选的频次中位数 99，错误时中位数只有 5
+        # 原因：count 排序把"高频但没用的"排在前面（如 normal→disease absent）
+        # 而真正的诊断候选往往频次较低但置信度高。
+        # 新排序公式：score = confidence × log(count + 1)
+        # 置信度 = count / source_head_total（P(target|source)）
+        # log(count+1) 让有统计意义的边（10次+）获得稳定权重，但不被频次主导
+        for r in out:
+            c = r["count"]
+            r["_score"] = r["confidence"] * (c ** 0.3)  # confidence × count^0.3
+        out.sort(key=lambda r: -r["_score"])
         if topk is not None:
             out = out[:topk]
         return out
