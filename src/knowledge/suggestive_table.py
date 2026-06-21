@@ -149,9 +149,90 @@ def build_suggestive_table(records: Iterable[dict]) -> dict:
         rows.sort(key=lambda r: (-r["count"], -r["confidence"]))
         table[src_head] = rows
 
-    return table
+    return (
+        table,
+        source_head_total,  # 返回以便后续构建联合表
+        edges,              # 原始边计数（key=(src_head, src_assertion, tgt_head, tgt_assertion)）
+    )
 
 
+# ---------------------------------------------------------------------------
+# 联合知识表（多 head 联合推理）
+# 统计 (head_a, head_b) 同时出现时 impression 的诊断分布
+# 只在 finding 侧统计（联合是 finding 侧的多个 head 组合）
+# ---------------------------------------------------------------------------
+def build_pair_table(records: Iterable[dict]) -> dict:
+    """构建 pair 共现表：两条 finding head 同时出现时，impression 的诊断分布。
+
+    输出：
+      {frozenset({head_a, head_b}): [
+          {"target_head": str, "target_assertion": str, "count": int, "confidence": float},
+          ...
+      ]}
+    """
+    from collections import defaultdict, Counter
+    pair_counts: dict[frozenset, Counter] = defaultdict(Counter)   # pair -> impression head count
+    pair_denom: dict[frozenset, int] = defaultdict(int)           # pair 出现总次数
+
+    for obj in records:
+        # finding 端所有 head
+        find_heads = set()
+        for bucket in ("positive", "negative", "uncertain", "other"):
+            for fact in (obj.get("findings_graph_compact", {}).get(bucket, []) or []):
+                h = normalize_head(fact.get("head") or "")
+                if h:
+                    find_heads.add(h)
+
+        # impression 端所有 head（含 suggestive_of 的 target）
+        imp_heads = Counter()
+        for bucket in ("positive", "negative", "uncertain", "other"):
+            for fact in (obj.get("impression_graph_compact", {}).get(bucket, []) or []):
+                h = normalize_head(fact.get("head") or "")
+                if h:
+                    imp_heads[h] += 1
+                for s in (fact.get("suggestive_of") or []):
+                    if isinstance(s, dict):
+                        sh = normalize_head(s.get("finding") or "")
+                        if sh:
+                            imp_heads[sh] += 1
+
+        if not imp_heads:
+            continue
+
+        # 生成本条所有 pair（最多取 4 个 head 的所有组合，防止组合爆炸）
+        fh_list = sorted(find_heads)
+        if len(fh_list) > 4:
+            fh_list = fh_list[:4]  # 对 4+ 个 finding head 的病例，只取前 4 个
+
+        from itertools import combinations
+        for a, b in combinations(fh_list, 2):
+            pair = frozenset({a, b})
+            pair_denom[pair] += 1
+            for ih, c in imp_heads.items():
+                pair_counts[pair][ih] += c
+
+    # 组装输出
+    pair_table: dict[str, list[dict]] = {}
+    for pair, counter in pair_counts.items():
+        denom = pair_denom[pair]
+        rows = []
+        for ih, c in counter.most_common(10):  # 最多取 10 个候选
+            rows.append({
+                "target_head": ih,
+                "target_assertion": "present",
+                "count": c,
+                "confidence": round(c / denom, 4) if denom else 0.0,
+            })
+        if rows:
+            key = " + ".join(sorted(pair))
+            pair_table[key] = rows
+
+    return pair_table
+
+
+# ---------------------------------------------------------------------------
+# 表统计
+# ---------------------------------------------------------------------------
 def table_stats(table: dict) -> dict:
     """统计表的基本指标，用于报告。"""
     total_edges = sum(len(v) for v in table.values())
@@ -184,9 +265,14 @@ class SuggestiveKnowledge:
         kb.query_candidates("opacity")  # 返回 opacity 可能 suggestive_of 的诊断列表
     """
 
-    def __init__(self, table_path: str, min_count: int = 3, min_confidence: float = 0.0):
+    def __init__(self, table_path: str, min_count: int = 3, min_confidence: float = 0.0,
+                 pair_table_path: str | None = None):
         with open(table_path, "r", encoding="utf-8") as fh:
             self.table: dict[str, list[dict]] = json.load(fh)
+        self.pair_table: dict[str, list[dict]] = {}
+        if pair_table_path and os.path.exists(pair_table_path):
+            with open(pair_table_path, "r", encoding="utf-8") as fh:
+                self.pair_table = json.load(fh)
         self.min_count = min_count
         self.min_confidence = min_confidence
 
@@ -212,14 +298,25 @@ class SuggestiveKnowledge:
         h = normalize_head(source_head)
         out = []
 
-        # --- 逆向逻辑：finding 全阴性 → disease absent / no finding ---
+        # --- 逆向逻辑 + 设备/管线规则 ---
         # 当 finding 里没有 present 的实体，或只有 normal/clear/unremarkable 时，
         # 知识表应该直接推荐 disease absent
         if finding_compact is not None:
             has_positive = False
+            has_device = False
             for fact in finding_compact.get("positive", []) or []:
                 ht = normalize_head(fact.get("head") or "")
-                if ht and ht not in ("normal", "clear", "unremarkable", "intact", "well aerated"):
+                if not ht: continue
+                # 设备类 head 不算"阳性实体"
+                if ht in ("endotracheal tube", "ng tube", "nasogastric tube", "orogastric tube",
+                          "enteric tube", "tube", "tubes",
+                          "picc line", "central line", "line", "catheter",
+                          "swan - ganz catheter", "pacemaker",
+                          "lead", "leads", "wire", "wires", "surgical clips", "clip", "clips",
+                          "port - a - cath", "picc", "suture"):
+                    has_device = True
+                    continue
+                if ht not in ("normal", "clear", "unremarkable", "intact", "well aerated"):
                     has_positive = True
                     break
             if not has_positive:
@@ -239,8 +336,29 @@ class SuggestiveKnowledge:
                         out = out[:topk]
                     return out
 
+        # --- 设备/管线类 finding 的规则补丁 ---
+        # 对常见的设备 head，如果原表没有覆盖，用规则补上
+        _table_rows = self.table.get(h, [])
+        if h in ("catheter", "endotracheal tube", "ng tube", "nasogastric tube",
+                 "enteric tube", "tube", "central line", "line",
+                 "picc", "picc line", "port - a - cath", "suture",
+                 "swan - ganz catheter", "lead", "wire", "pacemaker"):
+            # 若无原表记录，补充规则候选
+            if not _table_rows or all(r["count"] < self.min_count for r in _table_rows):
+                device_cands = [
+                    {"target_head": "atelectasis", "target_assertion": "present",
+                     "source_assertion": "present", "source_section": "rule",
+                     "count": 250, "confidence": 0.30},
+                    {"target_head": "pneumothorax", "target_assertion": "present",
+                     "source_assertion": "present", "source_section": "rule",
+                     "count": 200, "confidence": 0.25},
+                ]
+                # 插入到原表候选之前（但排在逆向候选之后）
+                out = [r for r in out if r.get("source_section") == "rule"] + device_cands + \
+                      [r for r in out if r.get("source_section") != "rule"]
+
         # --- 原表查询 ---
-        rows = self.table.get(h, [])
+        rows = _table_rows if locals().get("_table_rows") else self.table.get(h, [])
         for r in rows:
             if r["count"] < self.min_count:
                 continue
@@ -265,6 +383,46 @@ class SuggestiveKnowledge:
         if topk is not None:
             out = out[:topk]
         return out
+
+    def query_candidates_pair(
+        self,
+        heads: list[str],
+        topk: int = 5,
+    ) -> list[dict]:
+        """查询多 head 联合推理的候选诊断。
+
+        Args:
+            heads: finding 端所有 head 的列表（归一化后）。
+            topk: 返回候选数。
+        Returns:
+            候选列表，按 count 降序。
+        """
+        if not self.pair_table or len(heads) < 2:
+            return []
+
+        # 尝试所有 pair 组合，取共现最多的候选
+        candidates = {}
+        from itertools import combinations
+        fh_list = sorted(set(normalize_head(h) for h in heads if h))
+        if len(fh_list) > 4:
+            fh_list = fh_list[:4]
+
+        for a, b in combinations(fh_list, 2):
+            key = " + ".join(sorted([a, b]))
+            rows = self.pair_table.get(key, [])
+            for r in rows:
+                tgt = (r["target_head"], r["target_assertion"])
+                if tgt not in candidates:
+                    candidates[tgt] = {"target_head": r["target_head"],
+                                       "target_assertion": r["target_assertion"],
+                                       "count": 0, "confidence": 0.0,
+                                       "source_section": "pair"}
+                # 多 pair 共现同一诊断时，count 累加
+                candidates[tgt]["count"] += r["count"]
+                candidates[tgt]["confidence"] = max(candidates[tgt]["confidence"], r["confidence"])
+
+        out = sorted(candidates.values(), key=lambda x: -x["count"])
+        return out[:topk]
 
 
 # ---------------------------------------------------------------------------

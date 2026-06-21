@@ -282,6 +282,23 @@ def infer_impression(
                         if key not in seen_targets:
                             seen_targets.add(key)
                             all_candidates.append(c)
+
+        # 多 head 联合推理
+        all_find_heads = []
+        for bucket in ("positive", "negative", "uncertain", "other"):
+            for f in finding_compact.get(bucket, []) or []:
+                h = f.get("head") or ""
+                if h:
+                    all_find_heads.append(h)
+        pair_cands = knowledge.query_candidates_pair(all_find_heads, topk=5)
+        for c in pair_cands:
+            key = (c["target_head"], c["target_assertion"])
+            if key not in seen_targets:
+                seen_targets.add(key)
+                # pair 组合的候选置信度更高，插到前面
+                c["confidence"] = min(c["confidence"] + 0.15, 1.0)
+                all_candidates.insert(0, c)
+
         sugg_candidates = all_candidates[:topk_knowledge]
 
     # 3. 构建 prompt
