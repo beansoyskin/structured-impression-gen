@@ -10,8 +10,8 @@
 | §4.0 数据归一化 | ✅ 完成 | head 归一 + location 规范化，14万样本已跑出产物 |
 | §4.3 Knowledge Lookup | ✅ 完成 | 语料内 suggestive_of 统计表（1585源/10245边/50852次） |
 | §4.2 Case Retrieval | ✅ BM25 baseline 完成 | recall@5=50.7%, recall@10=59.5% (Jaccard≥0.5) |
+| §4.5 Verification | ✅ 确定性 check 完成 | 6个纯规则check，真实数据98.1%通过，错误注入37.8%被抓 |
 | §4.4 Abstraction+Inference | ⏳ 待做 | LLM + schema 约束 |
-| §4.5 Self-Reflective Verification | ⏳ 待做 | 7 个 check 函数 |
 | §4.6 Verbalize | ⏳ 待做 | 小 LLM |
 
 ## 目录结构
