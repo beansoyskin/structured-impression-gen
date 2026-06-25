@@ -267,6 +267,144 @@ def table_stats(table: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 显式规则：无急性心肺异常
+# ---------------------------------------------------------------------------
+_BUCKET_ASSERTION = {
+    "positive": "present",
+    "negative": "absent",
+    "uncertain": "uncertain",
+}
+
+_NORMAL_SUPPORT_HEADS = {
+    "normal", "clear", "unremarkable", "intact", "well aerated",
+}
+
+_DEVICE_OR_POSTOP_HEADS = {
+    "endotracheal tube", "ng tube", "nasogastric tube", "orogastric tube",
+    "enteric tube", "tube", "tubes", "picc line", "central line", "line",
+    "catheter", "swan - ganz catheter", "pacemaker", "lead", "leads",
+    "wire", "wires", "surgical clip", "clip", "clips", "port - a - cath",
+    "picc", "suture", "stent", "valve", "prosthesis",
+}
+
+_INCIDENTAL_ALLOWED_HEADS = {
+    "nipple shadow", "skin fold", "artifact", "calcification",
+    "scoliosis", "kyphosis", "degenerative change", "degenerative changes",
+    "osteopenia", "atherosclerosis", "tortuosity",
+}
+
+_CHRONIC_NON_ACUTE_HEADS = {
+    "rib fracture", "fracture", "deformity", "chronic deformity",
+    "healed fracture",
+}
+
+_NON_ACUTE_MODIFIERS = {
+    "remote", "chronic", "old", "healed", "stable", "unchanged", "prior",
+}
+
+_ACUTE_BLOCKING_HEADS = {
+    "consolidation", "focal consolidation", "opacity", "opacification",
+    "infiltrate", "pneumonia", "edema", "pulmonary edema",
+    "pneumothorax", "pleural effusion", "effusion", "atelectasis",
+    "collapse", "mass", "nodule", "nodular opacity", "lung lesion",
+    "enlarged cardiomediastinum", "cardiomegaly", "vascular congestion",
+    "congestion", "fracture", "rib fracture", "deformity",
+}
+
+
+def _fact_assertion(fact: dict, bucket: str) -> str:
+    assertion = normalize_assertion(fact.get("assertion"))
+    if assertion == "unknown":
+        assertion = _BUCKET_ASSERTION.get(bucket, "unknown")
+    return assertion
+
+
+def _fact_modifiers(fact: dict) -> set[str]:
+    return {
+        normalize_head(m)
+        for m in (fact.get("modifiers") or [])
+        if normalize_head(m)
+    }
+
+
+def _is_non_acute_allowed_fact(head: str, modifiers: set[str]) -> bool:
+    head_tokens = set(head.split())
+    if head in _NORMAL_SUPPORT_HEADS:
+        return True
+    if head in _DEVICE_OR_POSTOP_HEADS:
+        return True
+    if head in _INCIDENTAL_ALLOWED_HEADS:
+        return True
+    if head in _CHRONIC_NON_ACUTE_HEADS and modifiers & _NON_ACUTE_MODIFIERS:
+        return True
+    if (modifiers | head_tokens) & _NON_ACUTE_MODIFIERS and any(
+        token in head for token in ("fracture", "deformity")
+    ):
+        return True
+    return False
+
+
+def infer_no_acute_rule(finding_compact: dict | None) -> list[dict]:
+    """Return a high-confidence candidate when findings support no acute disease.
+
+    The rule is intentionally conservative: present/uncertain acute chest
+    abnormalities block it, while devices, artifacts, normal descriptions, and
+    chronic/remote rib findings do not.
+    """
+    if not finding_compact:
+        return []
+
+    positive_like_seen = False
+    evidence: list[dict] = []
+    blockers: list[dict] = []
+
+    for bucket in ("positive", "uncertain", "other"):
+        for fact in finding_compact.get(bucket, []) or []:
+            head = normalize_head(fact.get("head") or "")
+            if not head:
+                continue
+            assertion = _fact_assertion(fact, bucket)
+            if assertion == "absent":
+                continue
+            positive_like_seen = True
+            modifiers = _fact_modifiers(fact)
+            if _is_non_acute_allowed_fact(head, modifiers):
+                evidence.append({
+                    "head": head,
+                    "assertion": assertion,
+                    "reason": "non_acute_or_incidental",
+                })
+                continue
+            if assertion in ("present", "uncertain") and (
+                head in _ACUTE_BLOCKING_HEADS
+                or not _is_non_acute_allowed_fact(head, modifiers)
+            ):
+                blockers.append({"head": head, "assertion": assertion})
+
+    if blockers:
+        return []
+
+    negative_evidence = []
+    for fact in finding_compact.get("negative", []) or []:
+        head = normalize_head(fact.get("head") or "")
+        if head:
+            negative_evidence.append({"head": head, "assertion": "absent"})
+
+    if not positive_like_seen and not negative_evidence:
+        return []
+
+    return [{
+        "target_head": "acute cardiopulmonary abnormality",
+        "target_assertion": "absent",
+        "source_assertion": "mixed",
+        "source_section": "rule:no_acute",
+        "count": 100000,
+        "confidence": 0.90,
+        "evidence": evidence + negative_evidence[:8],
+    }]
+
+
+# ---------------------------------------------------------------------------
 # 查询器（§4.4 运行时用）
 # ---------------------------------------------------------------------------
 class SuggestiveKnowledge:
@@ -295,7 +433,7 @@ class SuggestiveKnowledge:
         source_head: str,
         source_assertion: str | None = None,
         topk: int | None = None,
-        finding_compact: dict = None,  # 可选：提供 finding 上下文以推断逆向逻辑
+        finding_compact: dict = None,  # 可选：提供 finding 上下文以推断无急性心肺异常规则
     ) -> list[dict]:
         """查询某 source_head 的 suggestive_of 候选诊断。
 
@@ -303,8 +441,8 @@ class SuggestiveKnowledge:
             source_head: 源 head（会自动归一化）。
             source_assertion: 可选，过滤同 assertion 的边。
             topk: 可选，取前 k 个。
-            finding_compact: 可选的完整 finding graph，用于推断逆向逻辑
-                （finding 全阴性 → disease absent）。
+            finding_compact: 可选的完整 finding graph，用于推断无急性心肺异常规则
+                （finding 无急性心肺异常证据 → acute cardiopulmonary abnormality absent）。
         Returns:
             候选列表，每项含 target_head/target_assertion/count/confidence，按 count 降序。
             已按 min_count/min_confidence 过滤。
@@ -315,46 +453,15 @@ class SuggestiveKnowledge:
         )
         out: list[dict] = []
 
-        # --- 逆向逻辑 + 设备/管线规则 ---
-        # 当 finding 里没有 present 的实体，或只有 normal/clear/unremarkable 时，
-        # 知识表应该直接推荐 disease absent
-        if finding_compact is not None:
-            has_abnormal = False
-            device_heads = {
-                "endotracheal tube", "ng tube", "nasogastric tube", "orogastric tube",
-                "enteric tube", "tube", "tubes", "picc line", "central line", "line",
-                "catheter", "swan - ganz catheter", "pacemaker", "lead", "leads",
-                "wire", "wires", "surgical clips", "clip", "clips", "port - a - cath",
-                "picc", "suture",
-            }
-            normal_heads = {"normal", "clear", "unremarkable", "intact", "well aerated"}
-            for bucket in ("positive", "uncertain", "other"):
-                for fact in finding_compact.get(bucket, []) or []:
-                    ht = normalize_head(fact.get("head") or "")
-                    if not ht:
-                        continue
-                # 设备类 head 不算"阳性实体"
-                    if ht not in device_heads and ht not in normal_heads:
-                        has_abnormal = True
-                        break
-                if has_abnormal:
-                    break
-            if not has_abnormal:
-                # 全阴性或只有正常描述 → 推荐 disease absent
-                reverse_cands = [
-                    {"target_head": "disease", "target_assertion": "absent",
-                     "source_assertion": "present", "source_section": "rule",
-                     "count": 99999, "confidence": 0.85},
-                    {"target_head": "normal", "target_assertion": "present",
-                     "source_assertion": "present", "source_section": "rule",
-                     "count": 85000, "confidence": 0.70},
-                ]
-                out.extend(reverse_cands)
-                if not self.table.get(h):
-                    # 此 head 在原表无记录 + 命中逆向逻辑 → 直接返回逆向候选
-                    if topk is not None:
-                        out = out[:topk]
-                    return out
+        # --- 无急性心肺异常规则 ---
+        # 无急性异常证据，或只有 normal/device/artifact/chronic finding 时，推荐更精确的
+        # "acute cardiopulmonary abnormality absent"。
+        no_acute_cands = infer_no_acute_rule(finding_compact)
+        out.extend(no_acute_cands)
+        if no_acute_cands and not self.table.get(h):
+            if topk is not None:
+                out = out[:topk]
+            return out
 
         # --- 设备/管线类 finding 的规则补丁 ---
         # 对常见的设备 head，如果原表没有覆盖，用规则补上
@@ -391,7 +498,7 @@ class SuggestiveKnowledge:
         # 排序分析发现：
         #   - Top1 错误时 53.9% 的候选只出现 1-9 次（低频噪声排第一）
         #   - Top1 正确时候选的频次中位数 99，错误时中位数只有 5
-        # 原因：count 排序把"高频但没用的"排在前面（如 normal→disease absent）
+        # 原因：count 排序把"高频但没用的"排在前面。
         # 而真正的诊断候选往往频次较低但置信度高。
         # 新排序公式：score = confidence × count^0.3
         # 置信度 = count / source_head_total（P(target|source)）
@@ -586,7 +693,7 @@ def _self_test():
         assert pair_cands and pair_cands[0]["source_assertion"] == "mixed"
         assert pair_cands[0]["supporting_pairs"] == [pair_key]
 
-    # uncertain 异常不能触发“全阴性”规则；查询也不能污染加载的原表。
+    # uncertain 异常不能触发“无急性心肺异常”规则；查询也不能污染加载的原表。
     uncertain_finding = {
         "positive": [],
         "negative": [],
@@ -596,6 +703,42 @@ def _self_test():
     assert kb.query_candidates("unknown", finding_compact=uncertain_finding) == []
     kb.query_candidates("opacity")
     assert all("_score" not in r for r in kb.table["opacity"])
+
+    # 无急性心肺异常规则：慢性/体外/伪影类阳性 finding 不阻止 no acute。
+    no_acute_finding = {
+        "positive": [
+            {"head": "nipple shadows", "assertion": "present"},
+            {"head": "clips", "assertion": "present"},
+            {"head": "rib fracture", "assertion": "present", "modifiers": ["remote"]},
+            {"head": "remote left-sided rib fractures", "assertion": "present"},
+            {"head": "chronic deformity", "assertion": "present"},
+        ],
+        "negative": [
+            {"head": "focal consolidation", "assertion": "absent"},
+            {"head": "pleural effusion", "assertion": "absent"},
+            {"head": "pneumothorax", "assertion": "absent"},
+        ],
+        "uncertain": [],
+        "other": [],
+    }
+    no_acute_cands = infer_no_acute_rule(no_acute_finding)
+    assert no_acute_cands
+    assert no_acute_cands[0]["target_head"] == "acute cardiopulmonary abnormality"
+    assert no_acute_cands[0]["target_assertion"] == "absent"
+    query_no_acute = kb.query_candidates("nipple shadows", finding_compact=no_acute_finding)
+    assert any(
+        c["target_head"] == "acute cardiopulmonary abnormality"
+        and c["target_assertion"] == "absent"
+        for c in query_no_acute
+    )
+
+    acute_blocking_finding = {
+        "positive": [{"head": "consolidation", "assertion": "present"}],
+        "negative": [{"head": "pneumothorax", "assertion": "absent"}],
+        "uncertain": [],
+        "other": [],
+    }
+    assert infer_no_acute_rule(acute_blocking_finding) == []
 
     print("[OK] §4.3 自测全部通过")
     print(f"     迷你集: source_heads={st['unique_source_heads']} edges={st['unique_edges']} total={st['total_occurrences']}")

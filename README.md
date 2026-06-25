@@ -8,7 +8,7 @@
 | 阶段 | 状态 | 说明 |
 |---|---|---|
 | §4.0 数据归一化 | ✅ 完成 | head 归一 + location 规范化，14万样本已跑出产物 |
-| §4.3 Knowledge Lookup | ✅ Recall@10=58.4% | 正向suggestive_of + 逆向逻辑 + 设备规则 + pair联合表 |
+| §4.3 Knowledge Lookup | ✅ Recall@10=58.4% | 正向suggestive_of + 无急性心肺异常规则 + 设备规则 + pair联合表 |
 | §4.2 Case Retrieval | ✅ BM25 baseline 完成 | recall@5=50.7%, recall@10=59.5% (Jaccard≥0.5) |
 | §4.5 Verification | ✅ 确定性 check 完成 | 6个纯规则check，真实数据98.1%通过 |
 | §4.4 Abstraction+Inference | ✅ v1 完成（需迭代） | Qwen3:14b + 知识RAG，exact_fact_f1≈0.25 |
@@ -88,6 +88,11 @@ Pair key 同时保留 source assertion 和 head，例如
 同一病例的重复 fact 只计一次；默认只输出至少 3 个病例支持的 pair。
 `SuggestiveKnowledge` 加载 `suggestive_of_table.json` 时，会自动加载同目录的
 `pair_table.json`（存在时）。
+
+运行时还包含一条显式规则：当 finding 中没有 present/uncertain 的急性心肺异常证据，
+且阳性 finding 只属于 normal/clear、device/clip、artifact/nipple shadow、
+remote/chronic fracture/deformity 等非急性或偶然发现时，候选输出
+`acute cardiopulmonary abnormality` + `absent`，而不是泛化的 `disease absent`。
 
 ## §4.0 关键设计决策（防止上下文丢失）
 

@@ -94,7 +94,7 @@ SYSTEM_PROMPT = """You are a radiologist generating structured impression facts 
 CRITICAL RULE: ABSTRACT findings into diagnoses. Do NOT copy findings into impression.
 - Example: finding "consolidation + air bronchogram" → impression "pneumonia"
 - Example: finding "congestion + effusion" → impression "congestive heart failure"
-- Example: all findings normal → impression "disease absent"
+- Example: all findings normal → impression "acute cardiopulmonary abnormality absent"
 
 RULES:
 1. Output a JSON array of fact objects with: head, assertion, locations, modifiers, suggestive_of.
@@ -201,7 +201,7 @@ def build_prompt(
 + normal | heart size
 - effusion
 - consolidation"""
-    norm_impression = """[{"head": "disease", "assertion": "absent", "locations": ["cardiopulmonary"], "modifiers": [], "suggestive_of": []}]"""
+    norm_impression = """[{"head": "acute cardiopulmonary abnormality", "assertion": "absent", "locations": [], "modifiers": [], "suggestive_of": []}]"""
     messages.append({"role": "user", "content": "### Findings:\n" + norm_finding + "\n### Impression:"})
     messages.append({"role": "assistant", "content": norm_impression})
 
@@ -340,7 +340,7 @@ def infer_impression(
         # 对 finding 里所有 head 查候选
         all_candidates = []
         seen_targets = set()
-        # 全局 finding 上下文（用于逆向逻辑）
+        # 全局 finding 上下文（用于无急性心肺异常规则）
         for bucket in ("positive", "negative", "uncertain", "other"):
             for f in finding_compact.get(bucket, []) or []:
                 h = f.get("head") or ""
