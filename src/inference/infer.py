@@ -17,7 +17,6 @@ import re
 import sys
 import urllib.request
 from dataclasses import dataclass
-from typing import Optional
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(os.path.dirname(_HERE))
@@ -25,7 +24,7 @@ if _ROOT not in sys.path:
     import sys
     sys.path.insert(0, _ROOT)
 
-from src.retrieval.serialize import serialize_finding, serialize_impression  # noqa: E402
+from src.retrieval.serialize import serialize_finding  # noqa: E402
 from src.knowledge.suggestive_table import SuggestiveKnowledge  # noqa: E402
 from src.retrieval.bm25_retriever import CaseRetriever  # noqa: E402
 
@@ -111,6 +110,71 @@ EXAMPLE_FINDING = """+ consolidation | left lower lobe
 - effusion"""
 EXAMPLE_IMPRESSION = """[{"head": "pneumonia", "assertion": "present", "locations": ["left lower lobe"], "modifiers": [], "suggestive_of": []}]"""
 
+FEW_SHOT_TEMPLATE = """### Similar case {n}
+### Findings:
+{finding_text}
+### Impression:"""
+
+
+def _prompt_assertion(raw, bucket: str | None = None) -> str:
+    if isinstance(raw, dict):
+        bucket = bucket or raw.get("bucket")
+        raw = raw.get("raw") or raw.get("value") or ""
+    value = str(raw or "").lower().replace("measurement::", "")
+    if "absent" in value:
+        return "absent"
+    if "uncertain" in value:
+        return "uncertain"
+    if "present" in value:
+        return "present"
+    if "positive" in value:
+        return "present"
+    if "negative" in value:
+        return "absent"
+    return {
+        "present": "present",
+        "absent": "absent",
+        "positive": "present",
+        "negative": "absent",
+        "uncertain": "uncertain",
+    }.get(bucket, "uncertain")
+
+
+def _prompt_suggestive(items: list | None) -> list:
+    normalized = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            normalized.append(item)
+            continue
+        target = item.get("head") or item.get("finding") or ""
+        if not target:
+            continue
+        assertion = item.get("assertion") or ""
+        assertion_bucket = assertion.get("bucket") if isinstance(assertion, dict) else None
+        normalized.append({
+            "head": target,
+            "assertion": _prompt_assertion(assertion, assertion_bucket),
+        })
+    return normalized
+
+
+def _impression_json(graph_compact: dict) -> str:
+    """Serialize a retrieved impression as schema-valid few-shot JSON."""
+    facts = []
+    for bucket in ("positive", "negative", "uncertain", "other"):
+        for fact in graph_compact.get(bucket, []) or []:
+            head = (fact.get("head") or "").strip()
+            if not head:
+                continue
+            facts.append({
+                "head": head,
+                "assertion": _prompt_assertion(fact.get("assertion") or "", bucket),
+                "locations": fact.get("locations") or [],
+                "modifiers": fact.get("modifiers") or [],
+                "suggestive_of": _prompt_suggestive(fact.get("suggestive_of")),
+            })
+    return json.dumps(facts, ensure_ascii=False)
+
 
 def build_prompt(
     finding_compact: dict,
@@ -145,18 +209,19 @@ def build_prompt(
     if retrieved_cases:
         for i, case in enumerate(retrieved_cases[:2]):  # 最多 2 个示例
             finding_text = case.finding_text if hasattr(case, "finding_text") else serialize_finding(case.get("finding_compact", {}))
-            impression_text = case.impression_text if hasattr(case, "impression_text") else serialize_impression(case.get("impression_compact", {}))
-            # 把可读 impression 转成 JSON fact 数组（简化：直接用 impression_text 作为参考）
-            sugg_text = "None"
+            impression_compact = (
+                case.impression_compact if hasattr(case, "impression_compact")
+                else case.get("impression_compact", {})
+            )
+            impression_json = _impression_json(impression_compact)
             messages.append({
                 "role": "user",
                 "content": FEW_SHOT_TEMPLATE.format(
-                    n=i+1, finding_text=finding_text,
-                    sugg_text=sugg_text,
-                    impression_json=impression_text,
+                    n=i + 1,
+                    finding_text=finding_text,
                 ),
             })
-            messages.append({"role": "assistant", "content": impression_text})
+            messages.append({"role": "assistant", "content": impression_json})
 
     # 构建当前 query
     finding_text = serialize_finding(finding_compact)
@@ -165,7 +230,11 @@ def build_prompt(
     sugg_lines = []
     if suggestive_candidates:
         for s in suggestive_candidates[:10]:
-            sugg_lines.append(f"  - {s['target_head']} (confidence: {s['confidence']:.0%}, source_assertion: {s['source_assertion']})")
+            sugg_lines.append(
+                f"  - {s['target_head']} "
+                f"(target_assertion: {s['target_assertion']}, "
+                f"confidence: {s['confidence']:.0%}, source: {s['source_section']})"
+            )
     sugg_text = "\n".join(sugg_lines) if sugg_lines else "None"
 
     query = f"""### Findings:
@@ -276,7 +345,12 @@ def infer_impression(
             for f in finding_compact.get(bucket, []) or []:
                 h = f.get("head") or ""
                 if h:
-                    cands = knowledge.query_candidates(h, topk=5, finding_compact=finding_compact)
+                    cands = knowledge.query_candidates(
+                        h,
+                        source_assertion=f.get("assertion") or None,
+                        topk=5,
+                        finding_compact=finding_compact,
+                    )
                     for c in cands:
                         key = (c["target_head"], c["target_assertion"])
                         if key not in seen_targets:
@@ -284,21 +358,25 @@ def infer_impression(
                             all_candidates.append(c)
 
         # 多 head 联合推理
-        all_find_heads = []
+        all_find_facts = []
         for bucket in ("positive", "negative", "uncertain", "other"):
             for f in finding_compact.get(bucket, []) or []:
                 h = f.get("head") or ""
                 if h:
-                    all_find_heads.append(h)
-        pair_cands = knowledge.query_candidates_pair(all_find_heads, topk=5)
+                    all_find_facts.append(f)
+        pair_cands = knowledge.query_candidates_pair(all_find_facts, topk=5)
         for c in pair_cands:
             key = (c["target_head"], c["target_assertion"])
             if key not in seen_targets:
                 seen_targets.add(key)
-                # pair 组合的候选置信度更高，插到前面
-                c["confidence"] = min(c["confidence"] + 0.15, 1.0)
-                all_candidates.insert(0, c)
+                all_candidates.append(c)
 
+        def candidate_score(candidate: dict) -> float:
+            if "score" in candidate:
+                return float(candidate["score"])
+            return candidate["confidence"] * (candidate["count"] ** 0.3)
+
+        all_candidates.sort(key=candidate_score, reverse=True)
         sugg_candidates = all_candidates[:topk_knowledge]
 
     # 3. 构建 prompt

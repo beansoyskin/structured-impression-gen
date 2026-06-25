@@ -149,11 +149,7 @@ def build_suggestive_table(records: Iterable[dict]) -> dict:
         rows.sort(key=lambda r: (-r["count"], -r["confidence"]))
         table[src_head] = rows
 
-    return (
-        table,
-        source_head_total,  # 返回以便后续构建联合表
-        edges,              # 原始边计数（key=(src_head, src_assertion, tgt_head, tgt_assertion)）
-    )
+    return table
 
 
 # ---------------------------------------------------------------------------
@@ -161,70 +157,86 @@ def build_suggestive_table(records: Iterable[dict]) -> dict:
 # 统计 (head_a, head_b) 同时出现时 impression 的诊断分布
 # 只在 finding 侧统计（联合是 finding 侧的多个 head 组合）
 # ---------------------------------------------------------------------------
-def build_pair_table(records: Iterable[dict]) -> dict:
+def build_pair_table(
+    records: Iterable[dict],
+    min_pair_count: int = 3,
+    max_candidates: int = 10,
+) -> dict:
     """构建 pair 共现表：两条 finding head 同时出现时，impression 的诊断分布。
 
     输出：
-      {frozenset({head_a, head_b}): [
+      {"<assertion_a>|<head_a> + <assertion_b>|<head_b>": [
           {"target_head": str, "target_assertion": str, "count": int, "confidence": float},
           ...
       ]}
+
+    count/denominator 均按病例计数，同一病例内重复 fact 不会重复累计。
+    默认只输出至少由 3 个病例支持的 pair，过滤一次性长尾并控制产物大小。
     """
-    from collections import defaultdict, Counter
-    pair_counts: dict[frozenset, Counter] = defaultdict(Counter)   # pair -> impression head count
-    pair_denom: dict[frozenset, int] = defaultdict(int)           # pair 出现总次数
+    from collections import Counter
+    from itertools import combinations
+
+    pair_counts: dict[tuple[tuple[str, str], tuple[str, str]], Counter] = defaultdict(Counter)
+    pair_denom: dict[tuple[tuple[str, str], tuple[str, str]], int] = defaultdict(int)
 
     for obj in records:
         # finding 端所有 head
-        find_heads = set()
+        find_items: set[tuple[str, str]] = set()
         for bucket in ("positive", "negative", "uncertain", "other"):
             for fact in (obj.get("findings_graph_compact", {}).get(bucket, []) or []):
                 h = normalize_head(fact.get("head") or "")
                 if h:
-                    find_heads.add(h)
+                    assertion = normalize_assertion(fact.get("assertion"))
+                    if assertion == "unknown":
+                        assertion = {"positive": "present", "negative": "absent",
+                                     "uncertain": "uncertain"}.get(bucket, "unknown")
+                    if assertion != "unknown":
+                        find_items.add((assertion, h))
 
-        # impression 端所有 head（含 suggestive_of 的 target）
-        imp_heads = Counter()
+        # 每个病例的同一 (head, assertion) 最多计一次，保证条件概率不超过 1。
+        imp_targets: set[tuple[str, str]] = set()
         for bucket in ("positive", "negative", "uncertain", "other"):
             for fact in (obj.get("impression_graph_compact", {}).get(bucket, []) or []):
                 h = normalize_head(fact.get("head") or "")
                 if h:
-                    imp_heads[h] += 1
+                    assertion = normalize_assertion(fact.get("assertion"))
+                    if assertion == "unknown":
+                        assertion = {"positive": "present", "negative": "absent",
+                                     "uncertain": "uncertain"}.get(bucket, "unknown")
+                    if assertion != "unknown":
+                        imp_targets.add((h, assertion))
                 for s in (fact.get("suggestive_of") or []):
                     if isinstance(s, dict):
-                        sh = normalize_head(s.get("finding") or "")
-                        if sh:
-                            imp_heads[sh] += 1
+                        sh = normalize_head(s.get("finding") or s.get("head") or "")
+                        assertion = normalize_assertion(s.get("assertion"))
+                        if sh and assertion != "unknown":
+                            imp_targets.add((sh, assertion))
 
-        if not imp_heads:
+        if not imp_targets or len(find_items) < 2:
             continue
 
-        # 生成本条所有 pair（最多取 4 个 head 的所有组合，防止组合爆炸）
-        fh_list = sorted(find_heads)
-        if len(fh_list) > 4:
-            fh_list = fh_list[:4]  # 对 4+ 个 finding head 的病例，只取前 4 个
-
-        from itertools import combinations
-        for a, b in combinations(fh_list, 2):
-            pair = frozenset({a, b})
+        # source assertion 是 pair 身份的一部分，避免 present/absent 组合混为一谈。
+        for pair in combinations(sorted(find_items), 2):
             pair_denom[pair] += 1
-            for ih, c in imp_heads.items():
-                pair_counts[pair][ih] += c
+            for target in imp_targets:
+                pair_counts[pair][target] += 1
 
     # 组装输出
     pair_table: dict[str, list[dict]] = {}
     for pair, counter in pair_counts.items():
         denom = pair_denom[pair]
+        if denom < min_pair_count:
+            continue
         rows = []
-        for ih, c in counter.most_common(10):  # 最多取 10 个候选
+        for (ih, assertion), c in counter.most_common(max_candidates):
             rows.append({
                 "target_head": ih,
-                "target_assertion": "present",
+                "target_assertion": assertion,
                 "count": c,
                 "confidence": round(c / denom, 4) if denom else 0.0,
             })
         if rows:
-            key = " + ".join(sorted(pair))
+            key = " + ".join(f"{assertion}|{head}" for assertion, head in pair)
             pair_table[key] = rows
 
     return pair_table
@@ -270,7 +282,9 @@ class SuggestiveKnowledge:
         with open(table_path, "r", encoding="utf-8") as fh:
             self.table: dict[str, list[dict]] = json.load(fh)
         self.pair_table: dict[str, list[dict]] = {}
-        if pair_table_path and os.path.exists(pair_table_path):
+        if pair_table_path is None:
+            pair_table_path = os.path.join(os.path.dirname(table_path), "pair_table.json")
+        if os.path.exists(pair_table_path):
             with open(pair_table_path, "r", encoding="utf-8") as fh:
                 self.pair_table = json.load(fh)
         self.min_count = min_count
@@ -296,30 +310,36 @@ class SuggestiveKnowledge:
             已按 min_count/min_confidence 过滤。
         """
         h = normalize_head(source_head)
-        out = []
+        normalized_source_assertion = (
+            normalize_assertion(source_assertion) if source_assertion else None
+        )
+        out: list[dict] = []
 
         # --- 逆向逻辑 + 设备/管线规则 ---
         # 当 finding 里没有 present 的实体，或只有 normal/clear/unremarkable 时，
         # 知识表应该直接推荐 disease absent
         if finding_compact is not None:
-            has_positive = False
-            has_device = False
-            for fact in finding_compact.get("positive", []) or []:
-                ht = normalize_head(fact.get("head") or "")
-                if not ht: continue
+            has_abnormal = False
+            device_heads = {
+                "endotracheal tube", "ng tube", "nasogastric tube", "orogastric tube",
+                "enteric tube", "tube", "tubes", "picc line", "central line", "line",
+                "catheter", "swan - ganz catheter", "pacemaker", "lead", "leads",
+                "wire", "wires", "surgical clips", "clip", "clips", "port - a - cath",
+                "picc", "suture",
+            }
+            normal_heads = {"normal", "clear", "unremarkable", "intact", "well aerated"}
+            for bucket in ("positive", "uncertain", "other"):
+                for fact in finding_compact.get(bucket, []) or []:
+                    ht = normalize_head(fact.get("head") or "")
+                    if not ht:
+                        continue
                 # 设备类 head 不算"阳性实体"
-                if ht in ("endotracheal tube", "ng tube", "nasogastric tube", "orogastric tube",
-                          "enteric tube", "tube", "tubes",
-                          "picc line", "central line", "line", "catheter",
-                          "swan - ganz catheter", "pacemaker",
-                          "lead", "leads", "wire", "wires", "surgical clips", "clip", "clips",
-                          "port - a - cath", "picc", "suture"):
-                    has_device = True
-                    continue
-                if ht not in ("normal", "clear", "unremarkable", "intact", "well aerated"):
-                    has_positive = True
+                    if ht not in device_heads and ht not in normal_heads:
+                        has_abnormal = True
+                        break
+                if has_abnormal:
                     break
-            if not has_positive:
+            if not has_abnormal:
                 # 全阴性或只有正常描述 → 推荐 disease absent
                 reverse_cands = [
                     {"target_head": "disease", "target_assertion": "absent",
@@ -358,70 +378,82 @@ class SuggestiveKnowledge:
                       [r for r in out if r.get("source_section") != "rule"]
 
         # --- 原表查询 ---
-        rows = _table_rows if locals().get("_table_rows") else self.table.get(h, [])
-        for r in rows:
+        for stored_row in _table_rows:
+            r = dict(stored_row)
             if r["count"] < self.min_count:
                 continue
             if r["confidence"] < self.min_confidence:
                 continue
-            if source_assertion and r["source_assertion"] != source_assertion:
+            if normalized_source_assertion and r["source_assertion"] != normalized_source_assertion:
                 continue
             out.append(r)
-        # --- 排序优化：用 confidence × log(count+1) 替代纯 count 排序 ---
+        # --- 排序优化：用 confidence × count^0.3 替代纯 count 排序 ---
         # 排序分析发现：
         #   - Top1 错误时 53.9% 的候选只出现 1-9 次（低频噪声排第一）
         #   - Top1 正确时候选的频次中位数 99，错误时中位数只有 5
         # 原因：count 排序把"高频但没用的"排在前面（如 normal→disease absent）
         # 而真正的诊断候选往往频次较低但置信度高。
-        # 新排序公式：score = confidence × log(count + 1)
+        # 新排序公式：score = confidence × count^0.3
         # 置信度 = count / source_head_total（P(target|source)）
-        # log(count+1) 让有统计意义的边（10次+）获得稳定权重，但不被频次主导
-        for r in out:
-            c = r["count"]
-            r["_score"] = r["confidence"] * (c ** 0.3)  # confidence × count^0.3
-        out.sort(key=lambda r: -r["_score"])
+        # 次线性频次项让高频边获得稳定权重，但不被频次完全主导。
+        out.sort(key=lambda r: -(r["confidence"] * (r["count"] ** 0.3)))
         if topk is not None:
             out = out[:topk]
         return out
 
     def query_candidates_pair(
         self,
-        heads: list[str],
+        findings: list[dict] | list[str],
         topk: int = 5,
     ) -> list[dict]:
         """查询多 head 联合推理的候选诊断。
 
         Args:
-            heads: finding 端所有 head 的列表（归一化后）。
+            findings: finding facts；字符串 head 仅用于兼容旧 pair 表。
             topk: 返回候选数。
         Returns:
             候选列表，按 count 降序。
         """
-        if not self.pair_table or len(heads) < 2:
+        if not self.pair_table or len(findings) < 2:
             return []
 
-        # 尝试所有 pair 组合，取共现最多的候选
+        # 尝试所有 pair 组合，聚合多个独立 pair 的支持强度。
         candidates = {}
         from itertools import combinations
-        fh_list = sorted(set(normalize_head(h) for h in heads if h))
-        if len(fh_list) > 4:
-            fh_list = fh_list[:4]
+        source_items: set[tuple[str, str]] = set()
+        for finding in findings:
+            if isinstance(finding, dict):
+                head = normalize_head(finding.get("head") or "")
+                assertion = normalize_assertion(finding.get("assertion"))
+            else:
+                head = normalize_head(finding)
+                assertion = "unknown"
+            if head:
+                source_items.add((assertion, head))
 
-        for a, b in combinations(fh_list, 2):
-            key = " + ".join(sorted([a, b]))
-            rows = self.pair_table.get(key, [])
+        for left, right in combinations(sorted(source_items), 2):
+            key = " + ".join(f"{assertion}|{head}" for assertion, head in (left, right))
+            legacy_key = " + ".join(sorted([left[1], right[1]]))
+            rows = self.pair_table.get(key, self.pair_table.get(legacy_key, []))
             for r in rows:
+                if r["count"] < self.min_count or r["confidence"] < self.min_confidence:
+                    continue
                 tgt = (r["target_head"], r["target_assertion"])
                 if tgt not in candidates:
                     candidates[tgt] = {"target_head": r["target_head"],
                                        "target_assertion": r["target_assertion"],
                                        "count": 0, "confidence": 0.0,
-                                       "source_section": "pair"}
-                # 多 pair 共现同一诊断时，count 累加
-                candidates[tgt]["count"] += r["count"]
+                                       "source_assertion": "mixed",
+                                       "source_section": "pair",
+                                       "score": 0.0,
+                                       "supporting_pairs": []}
+                # count/confidence 保持单条边语义；score 才跨 pair 累加。
+                candidates[tgt]["count"] = max(candidates[tgt]["count"], r["count"])
                 candidates[tgt]["confidence"] = max(candidates[tgt]["confidence"], r["confidence"])
+                candidates[tgt]["score"] += r["confidence"] * (r["count"] ** 0.3)
+                candidates[tgt]["supporting_pairs"].append(key)
 
-        out = sorted(candidates.values(), key=lambda x: -x["count"])
+        out = sorted(candidates.values(), key=lambda x: (-x["score"], -x["count"]))
         return out[:topk]
 
 
@@ -505,6 +537,65 @@ def _self_test():
     cands3 = kb2.query_candidates("opacity")
     assert all(c["count"] >= 3 for c in cands3), "min_count 过滤失效"
     os.unlink(tmp_path)
+
+    # 联合表：同病例重复 fact 不得使 confidence > 1，并保留目标 assertion。
+    pair_records = [
+        {
+            "findings_graph_compact": {"positive": [
+                {"head": h, "assertion": "definitely present"}
+                for h in ("alpha", "beta", "gamma", "delta", "epsilon")
+            ]},
+            "impression_graph_compact": {"positive": [
+                {"head": "pneumonia", "assertion": "definitely present"},
+                {"head": "pneumonia", "assertion": "definitely present"},
+            ]},
+        },
+        {
+            "findings_graph_compact": {"positive": [
+                {"head": "delta", "assertion": "definitely present"},
+                {"head": "epsilon", "assertion": "definitely present"},
+            ]},
+            "impression_graph_compact": {"negative": [
+                {"head": "pneumonia", "assertion": "definitely absent"},
+            ]},
+        },
+    ]
+    pair_table = build_pair_table(pair_records, min_pair_count=1)
+    pair_key = "present|delta + present|epsilon"
+    assert pair_key in pair_table
+    assert "present|alpha + present|epsilon" in pair_table, "不得只保留字典序前四个 finding head"
+    pair_rows = pair_table[pair_key]
+    assert all(0.0 <= r["confidence"] <= 1.0 for r in pair_rows)
+    assert {(r["target_head"], r["target_assertion"]) for r in pair_rows} == {
+        ("pneumonia", "present"), ("pneumonia", "absent")
+    }
+
+    # 查询器自动加载同目录 pair_table，统一返回候选 schema。
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        table_path = os.path.join(tmp_dir, "suggestive_of_table.json")
+        pair_path = os.path.join(tmp_dir, "pair_table.json")
+        with open(table_path, "w", encoding="utf-8") as fh:
+            json.dump(table, fh)
+        with open(pair_path, "w", encoding="utf-8") as fh:
+            json.dump(pair_table, fh)
+        kb_pair = SuggestiveKnowledge(table_path, min_count=1)
+        pair_cands = kb_pair.query_candidates_pair([
+            {"head": "delta", "assertion": "present"},
+            {"head": "epsilon", "assertion": "present"},
+        ])
+        assert pair_cands and pair_cands[0]["source_assertion"] == "mixed"
+        assert pair_cands[0]["supporting_pairs"] == [pair_key]
+
+    # uncertain 异常不能触发“全阴性”规则；查询也不能污染加载的原表。
+    uncertain_finding = {
+        "positive": [],
+        "negative": [],
+        "uncertain": [{"head": "nodule", "assertion": "uncertain"}],
+        "other": [],
+    }
+    assert kb.query_candidates("unknown", finding_compact=uncertain_finding) == []
+    kb.query_candidates("opacity")
+    assert all("_score" not in r for r in kb.table["opacity"])
 
     print("[OK] §4.3 自测全部通过")
     print(f"     迷你集: source_heads={st['unique_source_heads']} edges={st['unique_edges']} total={st['total_occurrences']}")

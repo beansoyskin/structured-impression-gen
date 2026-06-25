@@ -33,6 +33,7 @@ from src.norm.location_norm import normalize_location_list  # noqa: E402
 from src.inference.infer import infer_impression  # noqa: E402
 from src.verify.verifier import verify_impression  # noqa: E402
 from src.knowledge.suggestive_table import SuggestiveKnowledge  # noqa: E402
+from src.retrieval.bm25_retriever import CaseRetriever  # noqa: E402
 
 DATA_DEFAULT = r"E:\程序\医疗影像项目\数据\rexgradient\rexgradient_radgraph_structured_v3_full.jsonl"
 SUGGESTIVE_TABLE_PATH = os.path.join(_ROOT, "outputs", "suggestive_of_table.json")
@@ -175,6 +176,12 @@ def main(data_path: str, n_samples: int, use_rag: int) -> int:
         for line in f:
             if line.strip():
                 records.append(json.loads(line))
+
+    retriever = None
+    if use_rag >= 2:
+        print("构建 BM25 案例索引...", flush=True)
+        retriever = CaseRetriever.build_from_records(records)
+        print(f"BM25 索引病例数: {len(retriever.id_list)}", flush=True)
     sample = rng.sample(records, min(n_samples, len(records)))
 
     # 评测
@@ -199,7 +206,7 @@ def main(data_path: str, n_samples: int, use_rag: int) -> int:
             continue
 
         t0 = time.time()
-        result = infer_impression(fg, knowledge=knowledge)
+        result = infer_impression(fg, retriever=retriever, knowledge=knowledge)
         t1 = time.time()
         t_total += (t1 - t0)
 

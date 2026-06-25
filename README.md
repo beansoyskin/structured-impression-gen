@@ -33,12 +33,14 @@ ZCodeProject/
 ├── scripts/
 │   ├── build_norm.py            # §4.0 全量构建 head/location 映射
 │   ├── build_suggestive_table.py# §4.3 全量构建 suggestive_of 统计表
+│   ├── build_pair_table.py      # §4.3 构建 assertion-aware finding pair 表
 │   ├── build_and_eval_retrieval.py # §4.2 构建索引+评测
 │   └── inspect_other_region.py  # 诊断 region=other 的 location
 ├── outputs/                     # 产物（入库，可重建）
 │   ├── head_norm.json           # §4.0: raw head → 归一 head
 │   ├── location_norm.json       # §4.0: raw location → {laterality, region, lobe}
-│   └── suggestive_of_table.json # §4.3: source_head → 候选诊断(频次/置信度)
+│   ├── suggestive_of_table.json # §4.3: source_head → 候选诊断(频次/置信度)
+│   └── pair_table.json          # §4.3: (assertion,head) pair → 候选诊断
 ├── docs/                        # 研究方法文档
 ├── profile_data.py              # 全量数据画像（附录A来源）
 ├── sample_*.py                  # 采样诊断脚本（heads/locations/suggestive）
@@ -67,6 +69,25 @@ python src\norm\location_norm.py
 pip install nltk
 python -c "import nltk; nltk.download('wordnet')"
 ```
+
+## §4.3 知识表用法
+
+```cmd
+# 构建单 head suggestive_of 表
+python -m scripts.build_suggestive_table
+
+# 构建 finding pair 联合表（流式读取 JSONL）
+python -m scripts.build_pair_table
+
+# 运行构建器和查询器自测
+python src\knowledge\suggestive_table.py
+```
+
+Pair key 同时保留 source assertion 和 head，例如
+`present|consolidation + present|air bronchogram`。count 和 confidence 按病例计数，
+同一病例的重复 fact 只计一次；默认只输出至少 3 个病例支持的 pair。
+`SuggestiveKnowledge` 加载 `suggestive_of_table.json` 时，会自动加载同目录的
+`pair_table.json`（存在时）。
 
 ## §4.0 关键设计决策（防止上下文丢失）
 
